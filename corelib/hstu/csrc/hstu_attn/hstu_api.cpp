@@ -70,16 +70,33 @@ void set_params_fprop(Hstu_fwd_params* params,
                       bool is_paged_kv,
                       const at::Tensor& func,
                       int window_size_left,
-                      int window_size_right) {
+                      int window_size_right,
+                      int quant_mode = -1,
+                      const at::Tensor q_descale = torch::Tensor(),
+                      const at::Tensor k_descale = torch::Tensor(),
+                      const at::Tensor v_descale = torch::Tensor(),
+                      void* cu_seqlens_vt_descale_d = nullptr,
+                      void* cu_seqlens_q_block_descale = nullptr,
+                      void* cu_seqlens_kv_block_descale = nullptr,
+                      const at::Tensor vt = torch::Tensor(),
+                      const at::Tensor vt_descale = torch::Tensor()) {
   // Reset the parameters
   *params = {};
 
   params->arch = at::cuda::getCurrentDeviceProperties()->major * 10 + at::cuda::getCurrentDeviceProperties()->minor;
+  params->is_bf16 = q.dtype() == torch::kBFloat16;
+  params->is_e4m3 = q.dtype() == torch::kFloat8_e4m3fn;
+
 
   // Set the pointers and strides.
   params->q_ptr = q.data_ptr();
   params->k_ptr = k.data_ptr();
   params->v_ptr = v.data_ptr();
+  if (vt.numel() > 0) {
+    params->vt_ptr = vt.data_ptr();
+  } else {
+    params->vt_ptr = nullptr;
+  }
   // All stride are in elements, not bytes.
   params->q_row_stride = q.stride(-3);
   params->k_row_stride = k.stride(-3);
@@ -87,6 +104,10 @@ void set_params_fprop(Hstu_fwd_params* params,
   params->q_head_stride = q.stride(-2);
   params->k_head_stride = k.stride(-2);
   params->v_head_stride = v.stride(-2);
+  if (vt.numel() > 0) {
+    params->vt_row_stride = vt.stride(-1);
+    params->vt_head_stride = vt.stride(-2);
+  }
   if (out.numel() > 0) {
     params->o_ptr = out.data_ptr();
     params->o_row_stride = out.stride(-3);
@@ -109,6 +130,46 @@ void set_params_fprop(Hstu_fwd_params* params,
     params->rab_seqlen_q_stride = 0;
     params->rab_seqlen_k_stride = 0;
     params->h_rab = 0;
+  }
+
+  if (q_descale.numel() > 0) {
+    params->descale_q_ptr = q_descale.data_ptr<float>();
+    params->descale_q_head_stride = q_descale.stride(0);
+  } else {
+    params->descale_q_ptr = nullptr;
+    params->descale_q_head_stride = 0;
+  }
+  if (k_descale.numel() > 0) {
+    params->descale_k_ptr = k_descale.data_ptr<float>();
+    params->descale_k_head_stride = k_descale.stride(0);
+  } else {
+    params->descale_k_ptr = nullptr;
+    params->descale_k_head_stride = 0;
+  }
+  if (v_descale.numel() > 0) {
+    params->descale_v_ptr = v_descale.data_ptr<float>();
+    params->descale_v_head_stride = v_descale.stride(0);
+  } else {
+    params->descale_v_ptr = nullptr;
+    params->descale_v_head_stride = 0;
+  }
+  if (vt_descale.numel() > 0) {
+    params->descale_vt_ptr = vt_descale.data_ptr<float>();
+    params->descale_vt_row_stride = vt_descale.stride(-3);
+    params->descale_vt_head_stride = vt_descale.stride(-2);
+    params->cu_seqlens_vt_descale = static_cast<int*>(cu_seqlens_vt_descale_d);
+  } else {
+    params->descale_vt_ptr = nullptr;
+    params->descale_vt_row_stride = 0;
+    params->descale_vt_head_stride = 0;
+    params->cu_seqlens_vt_descale = nullptr;
+  }
+
+  if (quant_mode == 2) {
+    params->q_block_descale_head_stride = q_descale.stride(-2);
+    params->kv_block_descale_head_stride = k_descale.stride(-2);
+    params->cu_seqlens_q_block_descale = static_cast<int*>(cu_seqlens_q_block_descale);
+    params->cu_seqlens_kv_block_descale = static_cast<int*>(cu_seqlens_kv_block_descale);
   }
 
   params->num_contexts = static_cast<int*>(num_contexts_d);
@@ -137,6 +198,8 @@ void set_params_fprop(Hstu_fwd_params* params,
   params->scaling_seqlen = scaling_seqlen;
   params->d = d;
   params->alpha = alpha;
+  // 1: 1xDIM&128x1 quantization, 2: per-block quantization, 3: per-head quantization, 4: per-batch quantization, 5: per-tensor quantization.
+  params.quant_mode = quant_mode;
   // Set the masks.
   params->is_target = (num_targets_d != nullptr) || (cu_seqlens_t_d != nullptr);
   #ifdef HSTU_DISABLE_TARGET
@@ -309,7 +372,8 @@ void run_hstu_fwd_headdim(Hstu_fwd_params &params, cudaStream_t stream) {
 
 void run_hstu_fwd(Hstu_fwd_params &params, cudaStream_t stream) {
   RAB_SWITCH(params.has_rab, Has_rab, [&] {
-    FP16_BF16_SWITCH(params.is_bf16, [&] {
+    if (params.is_e4m3) {
+      using Dtype = cutlass::float_e4m3_t;
       #ifndef HSTU_DISABLE_ARBITRARY
       if (params.is_arbitrary_mask) {
         run_hstu_fwd_headdim<Dtype, Has_rab, false, false, false, false, true, HSTU_ARBITRARY_NFUNC>(params, stream); return;
@@ -328,7 +392,28 @@ void run_hstu_fwd(Hstu_fwd_params &params, cudaStream_t stream) {
         });
         #endif
       }
-    });
+    } else {
+      FP16_BF16_SWITCH(params.is_bf16, [&] {
+        #ifndef HSTU_DISABLE_ARBITRARY
+        if (params.is_arbitrary_mask) {
+          run_hstu_fwd_headdim<Dtype, Has_rab, false, false, false, false, true, HSTU_ARBITRARY_NFUNC>(params, stream); return;
+        }
+        #endif
+        #ifndef HSTU_DISABLE_LOCAL
+        if (params.is_local) { run_hstu_fwd_headdim<Dtype, Has_rab, true, false, false, false, false, 0>(params, stream); return; }
+        #endif
+        if (!params.is_causal) { run_hstu_fwd_headdim<Dtype, Has_rab, false, false, false, false, false, 0>(params, stream); return; }
+        else {
+          #ifndef HSTU_DISABLE_CAUSAL
+          CONTEXT_SWITCH(params.is_context, Is_context, [&] {
+            TARGET_SWITCH(params.is_target, Is_target, [&] {
+              run_hstu_fwd_headdim<Dtype, Has_rab, false, true, Is_context, Is_target, false, 0>(params, stream);
+            });
+          });
+          #endif
+        }
+      });
+    }
   });
 }
 
@@ -353,14 +438,23 @@ std::vector<at::Tensor> hstu_varlen_fwd(
     std::optional<const at::Tensor>& page_offsets,
     std::optional<const at::Tensor>& page_ids,
     std::optional<const at::Tensor>& last_page_lens,
-    std::optional<const at::Tensor>& cu_seqlens_t
+    std::optional<const at::Tensor>& cu_seqlens_t,
+    const int quant_mode = -1,
+    std::optional<const at::Tensor> &q_descale = std::nullopt, 
+    std::optional<const at::Tensor> &k_descale = std::nullopt, 
+    std::optional<const at::Tensor> &v_descale = std::nullopt, // num_heads xtotal_k x 1
+    std::optional<const at::Tensor> &cu_seqlens_vt_descale = std::nullopt, //b+1, Each element is round_up(actual_deq_1en/128)
+    std::optional<const at::Tensor> &cu_seqlens_q_block_descale = std::nullopt,
+    std::optional<const at::Tensor> &cu_seqlens_kv_block_descale = std::nullopt,
+    std::optional<const at::Tensor> &vt = std::nullopt,
+    std::optional<const at::Tensor> &vt_descale = std::nullopt, 
     ) {
   auto dprops = at::cuda::getCurrentDeviceProperties();
   TORCH_CHECK(dprops->major >= 8, "HSTU only supports Ampere GPUs or newer.");
 
   auto q_dtype = q.dtype();
-  TORCH_CHECK(q_dtype == torch::kFloat16 || q_dtype == torch::kBFloat16,
-              "HSTU only support fp16 and bf16 data type");
+  TORCH_CHECK(q_dtype == torch::kFloat16 || q_dtype == torch::kBFloat16 || q_dtype == torch::kFloat8_e4m3fn,
+              "HSTU only support fp16 and bf16 and fp8_e4m3 data type");
   TORCH_CHECK(k.dtype() == q_dtype, "query and key must have the same dtype");
   TORCH_CHECK(v.dtype() == q_dtype, "query and value must have the same dtype");
   TORCH_CHECK(cu_seqlens_q.dtype() == torch::kInt32, "cu_seqlens_q must have dtype int32");
@@ -382,6 +476,7 @@ std::vector<at::Tensor> hstu_varlen_fwd(
   const int head_size = q.size(2);
   const int total_k = k.size(0);
   const int num_heads_k = k.size(1);
+  const int total_q = q.size(0);
 
   CHECK_SHAPE(k, total_k, num_heads_k, head_size);
   CHECK_SHAPE(v, total_k, num_heads_k, head_size);
@@ -408,7 +503,8 @@ std::vector<at::Tensor> hstu_varlen_fwd(
     CHECK_SHAPE(num_targets.value(), batch_size);
   }
 
-  at::Tensor out = torch::empty_like(q);
+  auto out_type = q_dtype == torch::kFloat8_e4m3fn ? torch::kFloat16 : q_dtype;
+  at::Tensor out = torch::empty_like(q, out_type);
 
   auto round_multiple = [](int x, int m) { return (x + m - 1) / m * m; };
   const int seqlen_q_rounded = round_multiple(max_seqlen_q, sizeof(cutlass::uint128_t) / sizeof(q_dtype));
@@ -426,6 +522,54 @@ std::vector<at::Tensor> hstu_varlen_fwd(
     if (seqlen_k_rounded != max_seqlen_k) {
       rab = torch::nn::functional::pad(rab.value(), torch::nn::functional::PadFuncOptions(
                            {0, seqlen_k_rounded - max_seqlen_k}));
+    }
+  }
+
+  bool is_fp8 = q_dtype == torch::kFloat8_e4m3fn;
+  if (is_fp8) {
+    // TORCH_CHECK(quant_mode >= 0 && quant_mode <= 5, "quant_mode must be 0, 1, 2, 3, 4, or 5 when dtype is float8_e4m3fn");
+    TORCH_CHECK(quant_mode >= 1 && quant_mode <= 5, "quant_mode must be 2, 3, 4, or 5 when dtype is float8_e4m3fn, mode = 1 is not supported now");
+    TORCH_CHECK(q_descale.has_value() && k_descale.has_value(),
+                "q_descale and k_descale must be provided when dtype is float8_e4m3fn");
+    CHECK_DEVICE(q_descale.value());
+    CHECK_DEVICE(k_descale.value());
+    if (quant_mode == 1) {
+      TORCH_CHECK(vt.has_value() && vt_descale.has_value() && cu_seqlens_vt_descale.has_value(),
+                  "vt, vt_descale and cu_seqlens_vt_descale must be provided when dtype is float8_e4m3fn and quant_mode is 1");
+      CHECK_DEVICE(vt.value());
+      CHECK_DEVICE(vt_descale.value());
+      CHECK_DEVICE(cu_seqlens_vt_descale.value());
+      CHECK_SHAPE(vt.value(), total_k, num_heads_k, head_size);
+      // Add 128 to the total_q and total_k to avoid out of bounds access
+      CHECK_SHAPE(q_descale.value(), num_heads, total_q + 128);
+      CHECK_SHAPE(k_descale.value(), num_heads, total_k + 128);
+      CHECK_SHAPE(cu_seqlens_vt_descale.value(), batch_size + 1);
+    } else if (quant_mode == 2) {
+      TORCH_CHECK(v_descale.has_value() && cu_seqlens_q_block_descale.has_value() && cu_seqlens_kv_block_descale.has_value(),
+                  "v_descale, cu_seqlens_q_block_descale and cu_seqlens_kv_block_descale must be provided when dtype is float8_e4m3fn and quant_mode is 2");
+      CHECK_DEVICE(v_descale.value());
+      CHECK_DEVICE(cu_seqlens_q_block_descale.value());
+      CHECK_DEVICE(cu_seqlens_kv_block_descale.value());
+      CHECK_SHAPE(cu_seqlens_q_block_descale.value(), batch_size + 1);
+      CHECK_SHAPE(cu_seqlens_kv_block_descale.value(), batch_size + 1);
+    } else if (quant_mode == 3) {
+      TORCH_CHECK(v_descale.has_value(), "v_descale must be provided when dtype is float8_e4m3fn and quant_mode is 3");
+      CHECK_DEVICE(v_descale.value());
+      CHECK_SHAPE(q_descale.value(), batch_size, num_heads);
+      CHECK_SHAPE(k_descale.value(), batch_size, num_heads_k);
+      CHECK_SHAPE(v_descale.value(), batch_size, num_heads_k);
+    } else if (quant_mode == 4) {
+      TORCH_CHECK(v_descale.has_value(), "v_descale must be provided when dtype is float8_e4m3fn and quant_mode is 4");
+      CHECK_DEVICE(v_descale.value());
+      CHECK_SHAPE(q_descale.value(), batch_size);
+      CHECK_SHAPE(k_descale.value(), batch_size);
+      CHECK_SHAPE(v_descale.value(), batch_size);
+    } else if (quant_mode == 5) {
+      TORCH_CHECK(v_descale.has_value(), "v_descale must be provided when dtype is float8_e4m3fn and quant_mode is 5");
+      CHECK_DEVICE(v_descale.value());
+      CHECK_SHAPE(q_descale.value(), 1);
+      CHECK_SHAPE(k_descale.value(), 1);
+      CHECK_SHAPE(v_descale.value(), 1);
     }
   }
 
@@ -462,7 +606,16 @@ std::vector<at::Tensor> hstu_varlen_fwd(
                    is_paged_kv,
                    func.has_value() ? func.value() : torch::Tensor(),
                    window_size_left,         //
-                   window_size_right);       //
+                   window_size_right,
+                   quant_mode,
+                   q_descale.has_value() ? q_descale.value() : torch::Tensor(),
+                   k_descale.has_value() ? k_descale.value() : torch::Tensor(),
+                   v_descale.has_value() ? v_descale.value() : torch::Tensor(),
+                   cu_seqlens_vt_descale.has_value() ? cu_seqlens_vt_descale.value().data_ptr() : nullptr,
+                   cu_seqlens_q_block_descale.has_value() ? cu_seqlens_q_block_descale.value().data_ptr() : nullptr,
+                   cu_seqlens_kv_block_descale.has_value() ? cu_seqlens_kv_block_descale.value().data_ptr() : nullptr,
+                   vt.has_value() ? vt.value() : torch::Tensor(),
+                   vt_descale.has_value() ? vt_descale.value() : torch::Tensor());
   if (total_k > 0) {
     auto stream = at::cuda::getCurrentCUDAStream().stream();
     run_hstu_fwd(params, stream);
@@ -721,5 +874,5 @@ std::vector<at::Tensor> hstu_varlen_bwd(
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.doc() = "HstuAttention";
   m.def("varlen_fwd", &hstu_varlen_fwd, "Varlen hstu forward pass");
-  m.def("varlen_bwd", &hstu_varlen_bwd, "Varlen hstu backward pass");
+  // m.def("varlen_bwd", &hstu_varlen_bwd, "Varlen hstu backward pass");
 }

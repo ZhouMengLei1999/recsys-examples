@@ -610,6 +610,28 @@ inline __device__ void hstu_compute_attn_1rowblock(const Params& params,
         acc_s, tSrQ, tSrK, tSsQ, tSsK(_, _, _, buffer_stage), tiled_mma, smem_tiled_copy_Q,
         smem_tiled_copy_K, smem_thr_copy_Q, smem_thr_copy_K);
 
+    if (params.is_e4m3) {
+      float scale = 1.0f;
+      if (params.quant_mode == 2) {
+        int start_offset_q = params.cu_seqlens_q_block_descale[bidb];
+        int start_offset_kv = params.cu_seqlens_kv_block_descale[bidb];
+        float scale_q = params.descale_q_ptr[(start_offset_q + m_block) * params.q_block_descale_head_stride + bidh];
+        int bidh_kv = bidh / params.h_h_k_ratio;
+        float scale_k = params.descale_k_ptr[(start_offset_kv + n_block) * params.kv_block_descale_head_stride + bidh_kv];
+        scale = scale_q * scale_k;
+      } else if (params.quant_mode == 3) {
+        int bidh_kv = bidh / params.h_h_k_ratio;
+        scale = params.descale_q_ptr[bidb * params.descale_q_head_stride + bidh] * params.descale_k_ptr[bidb * params.descale_k_head_stride + bidh_kv];
+      } else if (params.quant_mode == 4) {
+        scale = params.descale_q_ptr[bidb] * params.descale_k_ptr[bidb];
+      } else if (params.quant_mode == 5) {
+        scale = params.descale_q_ptr[0] * params.descale_k_ptr[0];
+      }
+      for (int i = 0; i < size(acc_s); ++i) {
+        acc_s(i) *= scale;
+      }
+    }
+
     if (Is_arbitrary || Is_local || is_masking) {
       apply_mask(acc_s, n_block);
     }
@@ -638,7 +660,45 @@ inline __device__ void hstu_compute_attn_1rowblock(const Params& params,
     }
     fast_silu(acc_s);
 
-    // Convert acc_s from fp32 to fp16/bf16
+    float p_max = 1.0f;
+    if (params.is_e4m3) {
+        // Static shared memory for block-level p_max reduction
+        __shared__ float smem_p_max_block[Kernel_traits::kNThreads]; // Use kNThreads instead of fixed 1024
+
+        if (params.quant_mode > 0) {
+            float p_max_local = 0.0f; // Local p_max for each thread
+            for (int i = 0; i < size(acc_s); ++i) {
+                p_max_local = max(p_max_local, abs(acc_s(i)));
+            }
+
+            // Block-level reduction to find the global p_max within the block
+            smem_p_max_block[tidx] = p_max_local;
+            __syncthreads();
+
+            // Perform reduction in shared memory
+            for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+                if (tidx < stride) {
+                    smem_p_max_block[tidx] = max(smem_p_max_block[tidx], smem_p_max_block[tidx + stride]);
+                }
+                __syncthreads();
+            }
+
+            // Broadcast the block-level p_max to all threads
+            p_max = smem_p_max_block[0];
+            if (p_max == 0.0f) p_max = 1.0f;
+            
+            float fp8_max = 448.0f;
+            float scale_p = p_max / fp8_max;
+            float inv_scale_p = 1.0f / scale_p;
+            
+            for (int i = 0; i < size(acc_s); ++i) {
+                acc_s(i) *= inv_scale_p;
+            }
+            p_max = scale_p; // Store the actual scale factor used for dequantization later
+        }
+    }
+
+    // Convert acc_s from fp32 to Element (fp8 if quant_mode==4, else fp16/bf16)
     Tensor rP = make_tensor_like<Element>(acc_s);
     flash::convert_type_safe(acc_s, rP);
 
@@ -649,7 +709,33 @@ inline __device__ void hstu_compute_attn_1rowblock(const Params& params,
         flash::convert_layout_acc_Aregs<Kernel_traits::TiledMma>(rP.layout()));
 
     // compute qk @ v
-    flash::gemm_rs(acc_o, tOrP, tOrVt, tOsVt(_, _, _, buffer_stage), tiled_mma, smem_tiled_copy_V, smem_thr_copy_V);
+    if (params.is_e4m3) {
+      Tensor acc_o_tmp = make_tensor_like<ElementAccum>(acc_o);
+      clear(acc_o_tmp);
+      flash::gemm_rs(acc_o_tmp, tOrP, tOrVt, tOsVt(_, _, _, buffer_stage), tiled_mma, smem_tiled_copy_V, smem_thr_copy_V);
+      
+      float scale_v = 1.0f;
+      if (params.quant_mode == 2) {
+        int start_offset_kv = params.cu_seqlens_kv_block_descale[bidb];
+        int bidh_kv = bidh / params.h_h_k_ratio;
+        scale_v = params.descale_v_ptr[(start_offset_kv + n_block) * params.kv_block_descale_head_stride + bidh_kv];
+      } else if (params.quant_mode == 3) {
+        int bidh_kv = bidh / params.h_h_k_ratio;
+        scale_v = params.descale_v_ptr[bidb * params.descale_v_head_stride + bidh_kv];
+      } else if (params.quant_mode == 4) {
+        scale_v = params.descale_v_ptr[bidb];
+      } else if (params.quant_mode == 5) {
+        scale_v = params.descale_v_ptr[0];
+      }
+
+      float total_scale = p_max * scale_v;
+      for (int i = 0; i < size(acc_o); ++i) {
+          acc_o(i) += acc_o_tmp(i) * total_scale;
+      }
+
+    } else {
+      flash::gemm_rs(acc_o, tOrP, tOrVt, tOsVt(_, _, _, buffer_stage), tiled_mma, smem_tiled_copy_V, smem_thr_copy_V);
+    }
   };
 
   for (int n_block = n_block_max - 1, masking_step = 0; n_block >= n_block_min; ++masking_step, --n_block) {

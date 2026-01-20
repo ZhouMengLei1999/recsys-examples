@@ -121,6 +121,29 @@ struct Hstu_fwd_params : public Hstu_params {
   bool is_context;
   bool is_paged_kv;
   bool is_arbitrary_mask;
+
+  // FP8 related params
+  bool is_e4m3;
+  int quant_mode;
+  float* __restrict__ descale_q_ptr;
+  float* __restrict__ descale_k_ptr;
+  float* __restrict__ descale_v_ptr;
+  float* __restrict__ descale_vt_ptr;
+  index_t descale_q_head_stride;
+  index_t descale_k_head_stride;
+  index_t descale_v_head_stride;
+  index_t descale_vt_head_stride;
+  index_t descale_vt_row_stride;
+
+  int* __restrict__ cu_seqlens_q_block_descale;
+  int* __restrict__ cu_seqlens_kv_block_descale;
+  int* __restrict__ cu_seqlens_vt_descale;
+  index_t q_block_descale_head_stride;
+  index_t kv_block_descale_head_stride;
+
+  void* __restrict__ vt_ptr;
+  index_t vt_row_stride;
+  index_t vt_head_stride;
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////

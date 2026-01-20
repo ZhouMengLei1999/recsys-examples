@@ -42,10 +42,15 @@ struct Flash_kernel_traits {
   using MMA_Atom_Arch =
       std::conditional_t<std::is_same_v<elem_type, cutlass::half_t>,
                          MMA_Atom<SM80_16x8x16_F32F16F16F32_TN>,
-                         MMA_Atom<SM80_16x8x16_F32BF16BF16F32_TN>>;
+                         std::conditional_t<std::is_same_v<elem_type, cutlass::bfloat16_t>,
+                                            MMA_Atom<SM80_16x8x16_F32BF16BF16F32_TN>,
+                                            MMA_Atom<SM89_16x8x32_F32E4M3E4M3F32_TN>>>;
 
   using SmemCopyAtom = Copy_Atom<SM75_U32x4_LDSM_N, elem_type>;
-  using SmemCopyAtomTransposed = Copy_Atom<SM75_U16x8_LDSM_T, elem_type>;
+  using SmemCopyAtomTransposed =
+      std::conditional_t<sizeof(elem_type) == 1,
+                         Copy_Atom<SM75_U32x4_LDSM_N, elem_type>,
+                         Copy_Atom<SM75_U16x8_LDSM_T, elem_type>>;
 };
 
 // If Share_Q_K_smem is true, that forces Is_Q_in_regs to be true
